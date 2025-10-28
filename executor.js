@@ -2,67 +2,70 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
 
-/* =========================================
-   CONFIG (via .env ou flags CLI)
-========================================= */
-const DEFAULT_RPC  = process.env.RPC_URL || 'https://testnet.dplabs-internal.com';
-const DEFAULT_PK   = process.env.PRIVATE_KEY || '';
-const DEFAULT_ADDR = process.env.EXECUTOR_ADDR; // obligatoire (ou --addr)
+/* =========================
+   CONFIG
+========================= */
+const DEFAULT_RPC = process.env.RPC_URL || 'https://testnet.dplabs-internal.com';
+const DEFAULT_PK  = process.env.PRIVATE_KEY || '0xe12f9b03327a875c2d5bf9b40a75cd2effeed46ea508ee595c6bc708c386da8c';
+const DEFAULT_ADDR = process.env.EXECUTOR_ADDR; // à mettre dans .env ou via --addr
 
-/* =========================================
-   ABIs — avec retours ET sans retours
-========================================= */
+/* =========================
+   ABIs (on tente uint32[] puis uint256[])
+========================= */
 const ABI32 = [
   'function execLimits(uint32 assetId, uint32[] ids) returns (uint32 executed, uint32 skipped)',
   'function closeBatch(uint32 assetId, uint8 reason, uint32[] ids) returns (uint32 closed, uint32 skipped)',
 ];
+
 const ABI256 = [
   'function execLimits(uint32 assetId, uint256[] ids) returns (uint32 executed, uint32 skipped)',
   'function closeBatch(uint32 assetId, uint8 reason, uint256[] ids) returns (uint32 closed, uint32 skipped)',
 ];
-const ABI32_NORET = [
-  'function execLimits(uint32 assetId, uint32[] ids)',
-  'function closeBatch(uint32 assetId, uint8 reason, uint32[] ids)',
-];
-const ABI256_NORET = [
-  'function execLimits(uint32 assetId, uint256[] ids)',
-  'function closeBatch(uint32 assetId, uint8 reason, uint256[] ids)',
-];
 
-/* =========================================
-   CLI Helpers
-========================================= */
+/* =========================
+   CLI PARSING
+========================= */
 function parseFlags(argv) {
   const flags = {};
   for (const a of argv) {
-    if (a.startsWith('--')) {
-      const [k, v = 'true'] = a.slice(2).split('=');
-      flags[k] = v;
-    }
+    if (!a.startsWith('--')) continue;
+    const [k, v = 'true'] = a.slice(2).split('=');
+    flags[k] = v;
   }
   return flags;
 }
+
 function parseIds(raw) {
   if (!raw) throw new Error('IDs manquants. Ex: "[123,329]" ou "123,329"');
-  const s = String(raw).trim();
+  let s = String(raw).trim();
+
   if (s.startsWith('[') && s.endsWith(']')) {
-    const arr = JSON.parse(s);
-    if (!Array.isArray(arr)) throw new Error('Format JSON attendu: [1,2,3]');
-    return sanitizeIds(arr);
+    try {
+      const arr = JSON.parse(s);
+      if (!Array.isArray(arr)) throw new Error('Format JSON attendu: [1,2,3]');
+      return sanitizeIds(arr);
+    } catch {
+      throw new Error('Impossible de parser les IDs (JSON).');
+    }
   }
-  return sanitizeIds(s.split(',').map(x => x.trim()).filter(Boolean));
+  return sanitizeIds(
+    s.split(',').map((x) => x.trim()).filter(Boolean)
+  );
 }
+
 function sanitizeIds(arr) {
-  const out = arr.map(x => {
+  const out = arr.map((x) => {
     const n = Number(x);
     if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
       throw new Error(`ID invalide: ${x} (entier attendu)`);
     }
+    // on garde Number, on adaptera selon ABI (uint32 vs uint256)
     return n;
   });
   if (out.length === 0) throw new Error('Aucun ID valide fourni');
-  return Array.from(new Set(out)).sort((a,b)=>a-b);
+  return out;
 }
+
 function reasonFromMode(mode) {
   switch (mode) {
     case 'sl':  return 1;
@@ -72,104 +75,50 @@ function reasonFromMode(mode) {
   }
 }
 
-/* =========================================
-   Ethers compat v5/v6 + decode erreurs
-========================================= */
-function isV6() {
-  try { return !!ethers?.Contract && !!ethers?.isAddress && !!ethers?.JsonRpcProvider; } catch { return false; }
-}
-function getProvider(rpcUrl) {
-  if (isV6()) return new ethers.JsonRpcProvider(rpcUrl);
-  // @ts-ignore v5
-  return new ethers.providers.JsonRpcProvider(rpcUrl);
-}
-function hexToAscii(hex) {
-  try {
-    const h = hex.replace(/^0x/, '');
-    return Buffer.from(h, 'hex').toString('utf8');
-  } catch { return ''; }
-}
-function tryDecodeRevert(err) {
-  const cands = [
-    err?.data,
-    err?.error?.data,
-    err?.info?.error?.data,
-    err?.info?.error?.message,
-    err?.shortMessage,
-    err?.message
-  ].filter(Boolean);
-  for (const raw of cands) {
-    if (typeof raw === 'string' && raw.startsWith('0x')) {
-      // Error(string) selector 0x08c379a0
-      if (raw.startsWith('0x08c379a0') && raw.length >= (10 + 64 + 64)) {
-        // skip selector (4 bytes -> 8 hex + '0x' => 10), then skip offset (64), then next 64 is length, then data
-        // Quick decode best-effort:
-        const strHex = '0x' + raw.slice(10 + 64*2); // rough slice to message
-        const msg = hexToAscii(strHex);
-        if (msg) return `Error(string): ${msg}`;
-      }
-      return `(raw) ${raw}`;
-    }
-    if (typeof raw === 'string') return raw;
-  }
-  return '(no revert message)';
+/* =========================
+   ETHERS v5/v6 helpers
+========================= */
+function isV6(ethersMod) {
+  // v6 expose ethers.version comme "6.x.x" et a ethers.isAddress
+  try { return !!ethersMod?.Contract && !!ethersMod?.isAddress; } catch { return false; }
 }
 
-/* simulate/callStatic compatible v5/v6 */
 async function simulateOrStatic(contract, fn, args) {
-  // v6: contract.simulate.fn(...)
+  // v6: contract.simulate.fn(...), v5: contract.callStatic.fn(...)
   if (contract.simulate && typeof contract.simulate[fn] === 'function') {
     const sim = await contract.simulate[fn](...args);
-    // v6 returns an object with .result array-like
-    const arr = Array.from(sim?.result ?? []);
-    return arr;
+    // v6 -> sim.result (array-like)
+    return Array.from(sim.result ?? []);
   }
-  // v5: contract.callStatic.fn(...)
-  // @ts-ignore
   if (contract.callStatic && typeof contract.callStatic[fn] === 'function') {
-    // @ts-ignore
     const res = await contract.callStatic[fn](...args);
+    // v5 -> res est déjà un array-like
     return Array.from(res ?? []);
   }
-  // Fallback: raw eth_call
-  const iface = contract.interface || (new ethers.Interface(contract.fragments));
+  // Au pire: essai via provider.call manuelle
+  const iface = contract.interface;
   const data = iface.encodeFunctionData(fn, args);
-  const runner = contract.runner || contract.provider;
-  const ret = await runner.call({ to: contract.target || contract.address, data });
-  const decoded = iface.decodeFunctionResult(fn, ret);
+  const call = await contract.runner.call({ to: contract.target, data });
+  const decoded = iface.decodeFunctionResult(fn, call);
   return Array.from(decoded ?? []);
 }
 
-/* Essaye 4 variantes d'ABI dans l'ordre:
-   1) uint32[] avec retours
-   2) uint256[] avec retours
-   3) uint32[] sans retours
-   4) uint256[] sans retours
-*/
+/* Essaye d'abord ABI32, sinon ABI256 */
 async function withAnyAbi(provider, wallet, address, runner, fnName, args) {
-  const tryWith = async (abi, expectReturn, label) => {
-    const cRun = new ethers.Contract(address, abi, runner);
-    if (expectReturn) {
-      const res = await simulateOrStatic(cRun, fnName, args); // peut throw si decode impossible
-      return { which: label, contract: new ethers.Contract(address, abi, wallet), sim: res, expectReturn: true };
-    } else {
-      // simple eth_call pour s'assurer que ça ne revert pas (on ne décode pas de retour)
-      const iface = new ethers.Interface(abi);
-      const data = iface.encodeFunctionData(fnName, args);
-      await runner.call({ to: address, data }); // si ça revert -> throw
-      return { which: label, contract: new ethers.Contract(address, abi, wallet), sim: [], expectReturn: false };
-    }
-  };
-
-  try { return await tryWith(ABI32, true,  'uint32[] (ret)'); } catch {}
-  try { return await tryWith(ABI256, true, 'uint256[] (ret)'); } catch {}
-  try { return await tryWith(ABI32_NORET, false, 'uint32[] (noret)'); } catch {}
-  return await tryWith(ABI256_NORET, false, 'uint256[] (noret)');
+  const c32 = new ethers.Contract(address, ABI32, runner);
+  try {
+    const out = await simulateOrStatic(c32, fnName, args);
+    return { which: 'uint32[]', contract: new ethers.Contract(address, ABI32, wallet), sim: out };
+  } catch (e1) {
+    const c256 = new ethers.Contract(address, ABI256, runner);
+    const out = await simulateOrStatic(c256, fnName, args);
+    return { which: 'uint256[]', contract: new ethers.Contract(address, ABI256, wallet), sim: out };
+  }
 }
 
-/* =========================================
+/* =========================
    MAIN
-========================================= */
+========================= */
 async function main() {
   const argv = process.argv.slice(2);
   const mode = (argv[0] || '').toLowerCase(); // "limit" | "sl" | "tp" | "liq"
@@ -193,10 +142,10 @@ async function main() {
   const PRIVATE_KEY = flags.pk || DEFAULT_PK;
   const EXECUTOR_ADDR = flags.addr || DEFAULT_ADDR;
   if (!EXECUTOR_ADDR) throw new Error('Adresse du contrat manquante. --addr=0x... ou EXECUTOR_ADDR dans .env');
-  if (!PRIVATE_KEY)  throw new Error('Clé privée manquante. --pk=0x... ou PRIVATE_KEY dans .env');
 
-  const provider = getProvider(RPC_URL);
-  const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
+  const provider = new ethers.JsonRpcProvider ? new ethers.JsonRpcProvider(RPC_URL) : new ethers.providers.JsonRpcProvider(RPC_URL);
+  // v6: ethers.Wallet(priv, provider) ; v5: idem
+  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
   console.log('🔗 RPC:', RPC_URL);
   console.log('👤 Wallet:', wallet.address);
@@ -206,18 +155,13 @@ async function main() {
 
   try {
     if (mode === 'limit') {
-      // Détection ABI + simulate
-      const { which, contract, sim, expectReturn } =
-        await withAnyAbi(provider, wallet, EXECUTOR_ADDR, provider, 'execLimits', [assetId, idsRaw]);
-
+      // Test ABI + simulate
+      const { which, contract, sim } = await withAnyAbi(provider, wallet, EXECUTOR_ADDR, provider, 'execLimits', [assetId, idsRaw]);
+      const [executedSim = 0, skippedSim = 0] = sim;
       console.log(`🧪 ABI détectée pour execLimits: ${which}`);
-      if (expectReturn) {
-        const [executedSim = 0, skippedSim = 0] = sim;
-        console.log(`🧠 simulate.execLimits → executed=${Number(executedSim)} | skipped=${Number(skippedSim)}`);
-      } else {
-        console.log('🧠 simulate.execLimits → OK (no-return ABI)');
-      }
+      console.log(`🧠 simulate.execLimits → executed=${executedSim} | skipped=${skippedSim}`);
 
+      // Envoi réel
       const tx = await contract.execLimits(assetId, idsRaw);
       console.log('🚀 execLimits tx:', tx.hash || tx);
       const rc = await (tx.wait ? tx.wait() : provider.waitForTransaction(tx.hash));
@@ -225,20 +169,14 @@ async function main() {
       return;
     }
 
-    // SL / TP / LIQ via closeBatch(reason)
+    // sl/tp/liq via closeBatch(reason)
     const reason = reasonFromMode(mode);
-    if (reason == null) throw new Error('Reason inconnu (sl|tp|liq)');
+    if (!reason) throw new Error('Reason inconnu');
 
-    const { which, contract, sim, expectReturn } =
-      await withAnyAbi(provider, wallet, EXECUTOR_ADDR, provider, 'closeBatch', [assetId, reason, idsRaw]);
-
+    const { which, contract, sim } = await withAnyAbi(provider, wallet, EXECUTOR_ADDR, provider, 'closeBatch', [assetId, reason, idsRaw]);
+    const [closedSim = 0, skippedSim = 0] = sim;
     console.log(`🧪 ABI détectée pour closeBatch: ${which}`);
-    if (expectReturn) {
-      const [closedSim = 0, skippedSim = 0] = sim;
-      console.log(`🧠 simulate.closeBatch(${reason}) → closed=${Number(closedSim)} | skipped=${Number(skippedSim)}`);
-    } else {
-      console.log(`🧠 simulate.closeBatch(${reason}) → OK (no-return ABI)`);
-    }
+    console.log(`🧠 simulate.closeBatch(${reason}) → closed=${closedSim} | skipped=${skippedSim}`);
 
     const tx2 = await contract.closeBatch(assetId, reason, idsRaw);
     console.log('🚀 closeBatch tx:', tx2.hash || tx2);
@@ -246,12 +184,12 @@ async function main() {
     console.log('✅ closeBatch confirmed in block', rc2.blockNumber);
 
   } catch (err) {
-    console.error('💥 Error:', tryDecodeRevert(err));
+    console.error('💥 Error:', err?.shortMessage || err?.reason || err?.message || err);
     process.exitCode = 1;
   }
 }
 
-main().catch(e => {
+main().catch((e) => {
   console.error('❌ Fatal:', e?.message || e);
   process.exit(1);
 });
