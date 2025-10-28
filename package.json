@@ -1,0 +1,30 @@
+{
+    "name": "brokex-executor",
+    "version": "1.0.0",
+    "description": "Executor script for Brokex smart contract (execLimits & closeBatch)",
+    "main": "executor.js",
+    "type": "module",
+    "scripts": {
+        "limit": "node executor.js limit",
+        "sl": "node executor.js sl",
+        "tp": "node executor.js tp",
+        "liq": "node executor.js liq"
+    },
+    "dependencies": {
+        "dotenv": "^16.6.1",
+        "ethers": "^6.13.0",
+        "ws": "^8.18.3"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "keywords": [
+        "brokex",
+        "executor",
+        "smart-contract",
+        "trading",
+        "blockchain"
+    ],
+    "author": "Moustafa Khalil",
+    "license": "MIT"
+}
