@@ -1,29 +1,39 @@
 // trigger.js
-import 'dotenv/config';
-import WebSocket from 'ws';
-import { spawn } from 'node:child_process';
+import { ethers } from "ethers";
+import { spawn } from "node:child_process";
 
 /* ========================================
-   CONFIGURATION DE BASE
+   CONFIGURATION
 ======================================== */
-const WSS_URL   = process.env.WSS_URL || 'wss://testnet.dplabs-internal.com';
-const FEED_ADDR = (process.env.FEED_CONTRACT_ADDR || '').toLowerCase();
-const TOPIC0    = (process.env.TOPIC_FEEDUPDATED || '').toLowerCase();
+const RPC_URL = "https://atlantic.dplabs-internal.com";
+const CONTRACT_ADDR = "0x26524d23f70fbb17c8d5d5c3353a9693565b9be0";
+const ABI = [{
+  "inputs": [{ "internalType": "uint256[]", "name": "_pairIndexes", "type": "uint256[]" }],
+  "name": "getSvalues",
+  "outputs": [{
+    "components": [
+      { "internalType": "uint256", "name": "round", "type": "uint256" },
+      { "internalType": "uint256", "name": "decimals", "type": "uint256" },
+      { "internalType": "uint256", "name": "time", "type": "uint256" },
+      { "internalType": "uint256", "name": "price", "type": "uint256" }
+    ],
+    "internalType": "struct ISupraSValueFeed.priceFeed[]",
+    "name": "out",
+    "type": "tuple[]"
+  }],
+  "stateMutability": "view",
+  "type": "function"
+}];
 
-const API_BASE  = process.env.API_BASE || 'https://api.brokex.trade';
-const EXECUTOR_ADDR = process.env.EXECUTOR_ADDR || process.env.EXECUTOR_CONTRACT_ADDR;
-const RPC_URL   = process.env.RPC_URL || process.env.RPC_HTTP || 'https://testnet.dplabs-internal.com';
+const API_BASE = "https://api.brokex.trade";
+const EXECUTOR_ADDR = "0x01b9cb7ac346a3c97bb6fcf654480baa2060a61f";
 
-const RANGE_RATE = Number(process.env.RANGE_RATE || 0.0002); // ±0.02 %
-const MAX_IDS    = Number(process.env.MAX_IDS_PER_CALL || 200);
-const CALL_DELAY = Number(process.env.CALL_DELAY_MS || 1000);
-const EVENT_DEBOUNCE_MS = Number(process.env.EVENT_DEBOUNCE_MS || 8000);
-
-let KEYS_BY_ASSET = {};
-try { KEYS_BY_ASSET = JSON.parse(process.env.KEYS_BY_ASSET || '{}'); } catch {}
+const RANGE_RATE = 0.0002;
+const MAX_IDS = 200;
+const CALL_DELAY = 1000;
 
 /* ========================================
-   UTILITAIRES
+   UTILS
 ======================================== */
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -43,23 +53,21 @@ function uniqSorted(arr) {
 }
 
 /* ========================================
-   EXÉCUTEUR LOCAL (spawner)
+   EXECUTOR CALLER
 ======================================== */
-async function runExecutor(mode, { assetId, ids, pk }) {
+async function runExecutor(mode, { assetId, ids }) {
   if (!ids?.length) return;
-  if (!EXECUTOR_ADDR) throw new Error('EXECUTOR_ADDR manquant dans .env');
 
   const batches = chunk(ids, MAX_IDS);
   for (const group of batches) {
     const argIds = JSON.stringify(group);
     const args = [
       'executor.js',
-      mode,               // limit | sl | tp | liq
+      mode,
       argIds,
       `--asset=${assetId}`,
       `--addr=${EXECUTOR_ADDR}`,
-      `--rpc=${RPC_URL}`,
-      `--pk=${pk}`
+      `--rpc=${RPC_URL}`
     ];
 
     await new Promise((resolve, reject) => {
@@ -73,7 +81,7 @@ async function runExecutor(mode, { assetId, ids, pk }) {
 }
 
 /* ========================================
-   TRAITEMENT D’UN EVENT
+   TRAITEMENT DU PRIX
 ======================================== */
 async function handleFeedUpdated({ assetId, price }) {
   const from = price * (1 - RANGE_RATE);
@@ -91,67 +99,41 @@ async function handleFeedUpdated({ assetId, price }) {
 
   log(`[trigger] ✅ Collecté asset=${assetId} → ORDERS=${orderIds.length}, SL=${stopsSL.length}, TP=${stopsTP.length}, LIQ=${stopsLIQ.length}`);
 
-  const pk = KEYS_BY_ASSET[String(assetId)] || process.env.PRIVATE_KEY;
-  if (!pk) return log(`[trigger] ⚠️ Aucune clé pour asset ${assetId}, exécution ignorée.`);
-
-  if (orderIds.length) await runExecutor('limit', { assetId, ids: orderIds, pk });
-  if (stopsSL.length)  await runExecutor('sl',    { assetId, ids: stopsSL,  pk });
-  if (stopsTP.length)  await runExecutor('tp',    { assetId, ids: stopsTP,  pk });
-  if (stopsLIQ.length) await runExecutor('liq',   { assetId, ids: stopsLIQ, pk });
+  if (orderIds.length) await runExecutor('limit', { assetId, ids: orderIds });
+  if (stopsSL.length)  await runExecutor('sl',    { assetId, ids: stopsSL });
+  if (stopsTP.length)  await runExecutor('tp',    { assetId, ids: stopsTP });
+  if (stopsLIQ.length) await runExecutor('liq',   { assetId, ids: stopsLIQ });
 
   log('[trigger] ✅ Cycle complet exécuté');
 }
 
 /* ========================================
-   ÉCOUTE DES EVENTS
+   LOOP getSvalues
 ======================================== */
-const recentByAsset = new Map();
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const contract = new ethers.Contract(CONTRACT_ADDR, ABI, provider);
 
-function start() {
-  const ws = new WebSocket(WSS_URL);
+async function poll() {
+  try {
+    const res = await contract.getSvalues([0]);
+    const feed = res[0];
+    const price = Number(feed.price) / 10 ** Number(feed.decimals);
+    const assetId = 0;
 
-  ws.on('open', () => {
-    log(`[trigger] ✅ Connecté à ${WSS_URL}`);
-    const sub = {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'eth_subscribe',
-      params: ['logs', { address: FEED_ADDR, topics: [TOPIC0] }]
-    };
-    ws.send(JSON.stringify(sub));
-    log(`[trigger] 📡 Abonné à FeedUpdated sur ${FEED_ADDR}`);
-  });
+    log(`[trigger] 🔔 getSvalues() → price=${price}`);
+    await handleFeedUpdated({ assetId, price });
+  } catch (err) {
+    log(`[trigger] 💥 Erreur getSvalues():`, err.message);
+  }
+}
 
-  ws.on('message', async (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (data.method !== 'eth_subscription' || !data.params?.result) return;
-
-      const logEvent = data.params.result;
-      if ((logEvent.topics[0] || '').toLowerCase() !== TOPIC0) return;
-
-      const assetId = parseInt(logEvent.topics[1], 16);
-      const clean = (logEvent.data || '').replace(/^0x/, '');
-      const parts = clean.match(/.{1,64}/g) || [];
-      if (parts.length < 4) return;
-
-      const price = Number(BigInt('0x' + parts[0])) / 1e18;
-      const now = Date.now();
-      const prev = recentByAsset.get(assetId) || { t: 0, lastPrice: NaN };
-
-      if (now - prev.t < EVENT_DEBOUNCE_MS &&
-          Math.abs((price - prev.lastPrice) / (prev.lastPrice || 1)) < 1e-6) return;
-
-      recentByAsset.set(assetId, { t: now, lastPrice: price });
-      log(`[trigger] 🔔 FeedUpdated asset=${assetId} price=${price}`);
-      await handleFeedUpdated({ assetId, price });
-    } catch (err) {
-      log('[trigger] 💥 Parse error:', err.message);
-    }
-  });
-
-  ws.on('close', () => log('[trigger] ❌ WebSocket fermé'));
-  ws.on('error', (err) => log('[trigger] ⚠️ Erreur WS:', err.message));
+async function start() {
+  log(`[trigger] 🚀 Scheduler Supra getSvalues activé`);
+  while (true) {
+    const s = new Date().getSeconds();
+    if ([3, 15, 27, 39, 51].includes(s)) await poll();
+    await sleep(1000);
+  }
 }
 
 start();
