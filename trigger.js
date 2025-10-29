@@ -1,37 +1,41 @@
-// trigger.js
-import 'dotenv/config';
+// trigger.js — version sans .env, tout en dur
 import { ethers } from 'ethers';
 import { spawn } from 'node:child_process';
 
 /* =========================
-   ENV
+   CONFIG (tout en dur)
 ========================= */
-const RPC_URL      = process.env.RPC_URL  || 'https://atlantic.dplabs-internal.com';
-const FEED_ADDR    = (process.env.FEED_CONTRACT_ADDR || '0x26524d23f70fbb17c8d5d5c3353a9693565b9be0').toLowerCase();
-const API_BASE     = process.env.API_BASE || 'https://api.brokex.trade';
-const EXECUTOR_ADDR= process.env.EXECUTOR_ADDR || process.env.EXECUTOR_CONTRACT_ADDR;
+// Réseau & Oracle (Atlantic)
+const RPC_URL       = 'https://atlantic.dplabs-internal.com';
+const FEED_ADDR     = '0x26524d23f70fbb17c8d5d5c3353a9693565b9be0'.toLowerCase();
 
-const RUN_SECONDS  = (process.env.RUN_SECONDS || '3,15,27,39,51')
-  .split(',').map(s => Number(s.trim())).filter(n => Number.isInteger(n) && n>=0 && n<60);
+// Contrat d’exécution (même que ton executor.js)
+const EXECUTOR_ADDR = '0x01b9cb7ac346a3c97bb6fcf654480baa2060a61f';
 
-const RANGE_RATE   = Number(process.env.RANGE_RATE || 0.0002); // ±0.02%
-const MAX_IDS      = Number(process.env.MAX_IDS_PER_CALL || 200);
-const CALL_DELAY   = Number(process.env.CALL_DELAY_MS || 1000);
+// Clé privée (ASSET 0)
+const PRIVATE_KEY   = '0xe12f9b03327a875c2d5bf9b40a75cd2effeed46ea508ee595c6bc708c386da8c';
 
-let KEYS_BY_ASSET = {};
-try { KEYS_BY_ASSET = JSON.parse(process.env.KEYS_BY_ASSET || '{}'); } catch { KEYS_BY_ASSET = {}; }
+// API
+const API_BASE      = 'https://api.brokex.trade';
 
-const PAIR_INDEX   = Number(process.env.PAIR_INDEX || 0); // getSvalues([PAIR_INDEX])
-const ASSET_ID     = Number(process.env.ASSET_ID   || 0); // pour /bucket/range et executor
+// Logique
+const PAIR_INDEX    = 0;       // getSvalues([PAIR_INDEX])
+const ASSET_ID      = 0;       // pour /bucket/range et executor
+const RANGE_RATE    = 0.0002;  // ±0.02%
+const MAX_IDS       = 200;     // batch size vers executor.js
+const CALL_DELAY_MS = 1000;    // 1 seconde entre batches
+
+// Planning : secondes de la minute pour déclencher
+const RUN_SECONDS   = [3, 15, 27, 39, 51];
 
 /* =========================
-   ETHERS
+   ETHERS (v6)
 ========================= */
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const ABI = [
+const FEED_ABI = [
   'function getSvalues(uint256[] _pairIndexes) view returns (tuple(uint256 round,uint256 decimals,uint256 time,uint256 price)[] out)'
 ];
-const feed = new ethers.Contract(FEED_ADDR, ABI, provider);
+const feed = new ethers.Contract(FEED_ADDR, FEED_ABI, provider);
 
 /* =========================
    UTILS
@@ -46,11 +50,13 @@ async function fetchJson(url) {
 }
 function chunk(arr, n) {
   const out = [];
-  for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i, i+n));
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
   return out;
 }
 function uniqSortedIds(arr) {
-  return Array.from(new Set(arr.map(Number))).filter(n => Number.isFinite(n) && n>=0).sort((a,b)=>a-b);
+  return Array.from(new Set(arr.map(Number)))
+    .filter(n => Number.isFinite(n) && n >= 0)
+    .sort((a, b) => a - b);
 }
 
 /* =========================
@@ -58,15 +64,14 @@ function uniqSortedIds(arr) {
 ========================= */
 async function runExecutor(mode, { assetId, ids, pk }) {
   if (!ids?.length) return;
-  if (!EXECUTOR_ADDR) throw new Error('EXECUTOR_ADDR manquant dans .env');
 
   const batches = chunk(ids, MAX_IDS);
   for (const group of batches) {
     const argIds = JSON.stringify(group);
     const args = [
       'executor.js',
-      mode,                // limit | sl | tp | liq
-      argIds,
+      mode,                 // limit | sl | tp | liq
+      argIds,               // "[...ids]"
       `--asset=${assetId}`,
       `--addr=${EXECUTOR_ADDR}`,
       `--rpc=${RPC_URL}`,
@@ -79,7 +84,7 @@ async function runExecutor(mode, { assetId, ids, pk }) {
       p.on('error', reject);
     });
 
-    await sleep(CALL_DELAY);
+    await sleep(CALL_DELAY_MS);
   }
 }
 
@@ -89,20 +94,20 @@ async function runExecutor(mode, { assetId, ids, pk }) {
 let isRunning = false;
 
 async function runOnce() {
-  if (isRunning) return; // anti overlap
+  if (isRunning) return;  // anti-overlap
   isRunning = true;
   try {
-    // 1) Oracle fetch
+    // 1) Oracle: getSvalues([PAIR_INDEX])
     const out = await feed.getSvalues([BigInt(PAIR_INDEX)]);
     if (!out || !out[0]) {
-      log('[trigger] ⚠️ getSvalues a renvoyé un résultat vide.');
+      log('[trigger] ⚠️ getSvalues vide.');
       return;
     }
     const { price, decimals } = out[0];
     const priceHuman = Number(price) / (10 ** Number(decimals));
-    log(`[trigger] 🔔 Fetched price from getSvalues pair=${PAIR_INDEX} → price=${priceHuman} (decimals=${decimals})`);
+    log(`[trigger] 🔔 getSvalues pair=${PAIR_INDEX} → price=${priceHuman} (decimals=${decimals})`);
 
-    // 2) API range ±0.02%
+    // 2) API : /bucket/range (±0.02 %)
     const from = priceHuman * (1 - RANGE_RATE);
     const to   = priceHuman * (1 + RANGE_RATE);
     const url  = `${API_BASE}/bucket/range?asset=${ASSET_ID}&from=${from}&to=${to}&types=orders,stops&side=all&sort=lots&order=desc`;
@@ -112,24 +117,17 @@ async function runOnce() {
     const STOPS  = Array.isArray(data.items_stops)  ? data.items_stops  : [];
 
     const orderIds = uniqSortedIds(ORDERS.map(o => o.id));
-    const stopsSL  = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase()==='SL').map(s => s.id));
-    const stopsTP  = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase()==='TP').map(s => s.id));
-    const stopsLIQ = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase()==='LIQ').map(s => s.id));
+    const stopsSL  = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase() === 'SL').map(s => s.id));
+    const stopsTP  = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase() === 'TP').map(s => s.id));
+    const stopsLIQ = uniqSortedIds(STOPS.filter(s => String(s.type).toUpperCase() === 'LIQ').map(s => s.id));
 
     log(`[trigger] ✅ Collecté asset=${ASSET_ID} → ORDERS=${orderIds.length}, SL=${stopsSL.length}, TP=${stopsTP.length}, LIQ=${stopsLIQ.length}`);
 
-    // 3) Choix de la clé
-    const pk = KEYS_BY_ASSET[String(ASSET_ID)] || process.env.PRIVATE_KEY;
-    if (!pk) {
-      log(`[trigger] ⚠️ aucune clé pour asset ${ASSET_ID} (KEYS_BY_ASSET / PRIVATE_KEY) — skip envoi`);
-      return;
-    }
-
-    // 4) Exécutions (séparées)
-    if (orderIds.length) await runExecutor('limit', { assetId: ASSET_ID, ids: orderIds, pk });
-    if (stopsSL.length)  await runExecutor('sl',    { assetId: ASSET_ID, ids: stopsSL,  pk });
-    if (stopsTP.length)  await runExecutor('tp',    { assetId: ASSET_ID, ids: stopsTP,  pk });
-    if (stopsLIQ.length) await runExecutor('liq',   { assetId: ASSET_ID, ids: stopsLIQ, pk });
+    // 3) Exécutions séparées via executor.js (lots de 200, 1s pause)
+    if (orderIds.length) await runExecutor('limit', { assetId: ASSET_ID, ids: orderIds, pk: PRIVATE_KEY });
+    if (stopsSL.length)  await runExecutor('sl',    { assetId: ASSET_ID, ids: stopsSL,  pk: PRIVATE_KEY });
+    if (stopsTP.length)  await runExecutor('tp',    { assetId: ASSET_ID, ids: stopsTP,  pk: PRIVATE_KEY });
+    if (stopsLIQ.length) await runExecutor('liq',   { assetId: ASSET_ID, ids: stopsLIQ, pk: PRIVATE_KEY });
 
     log('[trigger] ✅ Cycle complet exécuté');
   } catch (e) {
@@ -140,7 +138,7 @@ async function runOnce() {
 }
 
 /* =========================
-   SCHEDULER
+   SCHEDULER (3,15,27,39,51 s)
 ========================= */
 function startScheduler() {
   log(`[trigger] 🕒 Scheduler prêt (secondes=${RUN_SECONDS.join(',')}) | RPC=${RPC_URL} | FEED=${FEED_ADDR}`);
@@ -151,6 +149,7 @@ function startScheduler() {
     const sec = now.getSeconds();
     if (sec === lastSecond) return;
     lastSecond = sec;
+
     if (RUN_SECONDS.includes(sec)) runOnce();
   }, 250);
 }
