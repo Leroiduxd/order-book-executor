@@ -1,4 +1,5 @@
 // trigger.js — multi-assets, per-asset PK, parallel execution + verify on skipped
+// + per-price-slot "clean-skip" suppression after 3 clean checks
 import { ethers } from 'ethers';
 import { spawn } from 'node:child_process';
 
@@ -54,26 +55,24 @@ const ASSETS = [
 ];
 
 /* =========================
-   CONFIG (adapte si besoin)
+   CONFIG
 ========================= */
-// Oracle feed (Atlantic)
 const RPC_URL    = 'https://atlantic.dplabs-internal.com';
 const FEED_ADDR  = '0x26524d23f70fbb17c8d5d5c3353a9693565b9be0'.toLowerCase();
 
-// API
 const API_BASE    = 'https://api.brokex.trade';
-const VERIFY_BASE = API_BASE; // même host
+const VERIFY_BASE = API_BASE;
 
-// Executor
 const EXECUTOR_PATH = 'executor.js';
 const EXECUTOR_ADDR = process.env.EXECUTOR_ADDR || '0x04a7cdf3b3aff0a0f84a94c48095d84baa91ec11';
 const EXECUTOR_RPC  = process.env.RPC_URL || RPC_URL;
 
-// Logique
 const RANGE_RATE    = 0.0002;   // ±0.02%
 const MAX_IDS       = 200;      // batch size
 const CALL_DELAY_MS = 1000;     // 1s entre batches
 const RUN_SECONDS   = [3, 15, 27, 39, 51];
+
+const CLEAN_SKIP_LIMIT = 3;     // après 3 clean-skips sur le même price slot → on n’envoie plus
 
 /* =========================
    Per-asset Private Keys
@@ -132,21 +131,15 @@ const feed = new ethers.Contract(FEED_ADDR, FEED_ABI, provider);
 ========================= */
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const chunk = (arr, n) => {
-  const out = [];
-  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-  return out;
-};
-const uniqSortedIds = (arr) => Array.from(new Set(arr.map(Number)))
-  .filter(n => Number.isFinite(n) && n >= 0)
-  .sort((a, b) => a - b);
+const chunk = (arr, n) => { const out=[]; for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; };
+const uniqSortedIds = (arr) => Array.from(new Set(arr.map(Number))).filter(n => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
+const priceSlot = (priceHuman) => Math.round(priceHuman * 1e4); // 1e-4 slot
 
 async function fetchJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} @ ${url}`);
   return res.json();
 }
-
 function getPkForAsset(assetId) {
   if (ASSET_PKS[assetId]) return ASSET_PKS[assetId];
   if (process.env[`PK_${assetId}`]) return process.env[`PK_${assetId}`];
@@ -158,37 +151,76 @@ function getPkForAsset(assetId) {
    Verify caller
 ========================= */
 async function callVerify(ids) {
-  if (!ids?.length) return;
+  if (!ids?.length) return null;
   const url = `${VERIFY_BASE}/verify/${ids.join(',')}`;
   try {
     const res = await fetch(url);
+    const txt = await res.text().catch(() => '');
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
       log(`[verify] HTTP ${res.status} ${res.statusText} :: ${txt}`);
-      return;
+      return null;
     }
-    const json = await res.json().catch(() => ({}));
-    log(`[verify] ✅ ${url} → ${JSON.stringify(json)}`);
+    const json = JSON.parse(txt || '{}');
+    log(`[verify] ✅ ${url} → ${txt}`);
+    return json; // {ok, checked, updated, mismatches}
   } catch (e) {
     log(`[verify] 💥 ${url} → ${e?.message || String(e)}`);
+    return null;
   }
 }
 
 /* =========================
-   Executor wrapper
-   -> capture stdout/stderr, parse "simulate.* → skipped=K"
-   -> si skipped>0 => callVerify(batchIds)
+   Clean-skip suppression store
+   key: `${assetId}:${slot}` -> Map<id, count>
 ========================= */
-async function runExecutor(mode, { assetId, ids, pk }) {
+const suppressMap = new Map();
+
+function supKey(assetId, slot) { return `${assetId}:${slot}`; }
+
+function filterSuppressed(assetId, slot, ids) {
+  const key = supKey(assetId, slot);
+  const m = suppressMap.get(key);
+  if (!m) return ids;
+  return ids.filter(id => (m.get(id) || 0) < CLEAN_SKIP_LIMIT);
+}
+
+function incSuppression(assetId, slot, ids) {
+  const key = supKey(assetId, slot);
+  let m = suppressMap.get(key);
+  if (!m) { m = new Map(); suppressMap.set(key, m); }
+  for (const id of ids) {
+    m.set(id, (m.get(id) || 0) + 1);
+  }
+}
+
+function clearSuppression(assetId, slot, ids) {
+  const key = supKey(assetId, slot);
+  const m = suppressMap.get(key);
+  if (!m) return;
+  for (const id of ids) m.delete(id);
+}
+
+/* =========================
+   Executor wrapper
+   - filtre avec suppression
+   - parse simulate.* skipped
+   - verify → si updated==0 → incSuppression
+   - sinon clearSuppression
+========================= */
+async function runExecutor(mode, { assetId, ids, pk, slot }) {
   if (!ids?.length) return;
-  if (!pk) {
-    log(`[executor] ⚠️ pas de PK pour asset ${assetId}, skip.`);
+  if (!pk) { log(`[executor] ⚠️ pas de PK pour asset ${assetId}, skip.`); return; }
+
+  // filter by current slot suppression
+  const filtered = filterSuppressed(assetId, slot, ids);
+  if (!filtered.length) {
+    log(`[executor] ⛔ tous les IDs déjà clean-skipped (${CLEAN_SKIP_LIMIT}x) sur slot=${slot}, rien à faire.`);
     return;
   }
 
-  const batches = chunk(ids, MAX_IDS);
+  const batches = chunk(filtered, MAX_IDS);
   for (const group of batches) {
-    const argIds = JSON.stringify(group); // "[..]"
+    const argIds = JSON.stringify(group);
     const args = [
       EXECUTOR_PATH,
       mode,
@@ -200,28 +232,18 @@ async function runExecutor(mode, { assetId, ids, pk }) {
     ];
 
     let out = '';
-    let err = '';
     let skippedSim = 0;
+    let execFailed = false;
 
     await new Promise((resolve, reject) => {
       const p = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-      p.stdout.on('data', (buf) => {
-        const s = buf.toString();
-        out += s;
-        process.stdout.write(s);
-      });
-      p.stderr.on('data', (buf) => {
-        const s = buf.toString();
-        err += s;
-        process.stderr.write(s);
-      });
-
+      p.stdout.on('data', (buf) => { const s = buf.toString(); out += s; process.stdout.write(s); });
+      p.stderr.on('data', (buf) => { const s = buf.toString(); process.stderr.write(s); });
       p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${mode} exit ${code}`))));
       p.on('error', reject);
     }).catch((e) => {
+      execFailed = true;
       log(`[executor] 💥 ${mode} error:`, e?.message || String(e));
-      skippedSim = group.length; // prudence: tout vérifier si l’exec a échoué
     });
 
     try {
@@ -231,9 +253,26 @@ async function runExecutor(mode, { assetId, ids, pk }) {
       if (m2) skippedSim = Number(m2[2] || 0);
     } catch { /* noop */ }
 
-    if (skippedSim > 0) {
-      log(`[executor] 🔎 skipped=${skippedSim} → verify(${group.length} ids)`);
-      await callVerify(group);
+    if (execFailed) {
+      // conservative: verify the whole group (we didn't get a valid sim)
+      const ver = await callVerify(group);
+      if (ver && ver.updated === 0) incSuppression(assetId, slot, group);
+      else if (ver && (ver.updated > 0 || (Array.isArray(ver.mismatches) && ver.mismatches.length))) {
+        clearSuppression(assetId, slot, group);
+      }
+    } else if (skippedSim > 0) {
+      // only verify if simulate says some were skipped
+      const ver = await callVerify(group);
+      if (ver && ver.updated === 0) {
+        incSuppression(assetId, slot, group);
+        const m = suppressMap.get(supKey(assetId, slot));
+        const reached = group.filter(id => (m?.get(id) || 0) >= CLEAN_SKIP_LIMIT);
+        if (reached.length) {
+          log(`[executor] 🧊 IDs gelés (${CLEAN_SKIP_LIMIT} clean-skips) sur slot=${slot}: ${reached.join(',')}`);
+        }
+      } else if (ver && (ver.updated > 0 || (Array.isArray(ver.mismatches) && ver.mismatches.length))) {
+        clearSuppression(assetId, slot, group);
+      }
     }
 
     await sleep(CALL_DELAY_MS);
@@ -252,13 +291,11 @@ async function runOnceForAsset(asset) {
   try {
     // 1) Oracle (pairIndex = asset.id)
     const out = await feed.getSvalues([BigInt(assetId)]);
-    if (!out || !out[0]) {
-      log(`[trigger] ⚠️ getSvalues vide pour asset=${assetId}.`);
-      return;
-    }
+    if (!out || !out[0]) { log(`[trigger] ⚠️ getSvalues vide pour asset=${assetId}.`); return; }
     const { price, decimals } = out[0];
     const priceHuman = Number(price) / (10 ** Number(decimals));
-    log(`[trigger] 🔔 asset=${assetId} (${asset.key}) → price=${priceHuman} (decimals=${decimals})`);
+    const slot = priceSlot(priceHuman);
+    log(`[trigger] 🔔 asset=${assetId} (${asset.key}) → price=${priceHuman} (slot=${slot})`);
 
     // 2) API range ±0.02 %
     const from = priceHuman * (1 - RANGE_RATE);
@@ -278,11 +315,11 @@ async function runOnceForAsset(asset) {
 
     const pk = getPkForAsset(assetId);
 
-    // 3) Envois (séquentiel par actif)
-    if (orderIds.length) await runExecutor('limit', { assetId, ids: orderIds, pk });
-    if (stopsSL.length)  await runExecutor('sl',    { assetId, ids: stopsSL,  pk });
-    if (stopsTP.length)  await runExecutor('tp',    { assetId, ids: stopsTP,  pk });
-    if (stopsLIQ.length) await runExecutor('liq',   { assetId, ids: stopsLIQ, pk });
+    // 3) Envois (séquentiel par actif), avec suppression par slot
+    if (orderIds.length) await runExecutor('limit', { assetId, ids: orderIds, pk, slot });
+    if (stopsSL.length)  await runExecutor('sl',    { assetId, ids: stopsSL,  pk, slot });
+    if (stopsTP.length)  await runExecutor('tp',    { assetId, ids: stopsTP,  pk, slot });
+    if (stopsLIQ.length) await runExecutor('liq',   { assetId, ids: stopsLIQ, pk, slot });
 
   } catch (e) {
     log(`[trigger] 💥 asset=${asset.id} error:`, e?.shortMessage || e?.message || String(e));
@@ -292,8 +329,7 @@ async function runOnceForAsset(asset) {
 }
 
 /* =========================
-   Scheduler (3,15,27,39,51 s)
-   -> lance TOUS les actifs simultanément
+   Scheduler
 ========================= */
 function startScheduler() {
   log(`[trigger] 🕒 Scheduler (secs=${RUN_SECONDS.join(',')}) | RPC=${RPC_URL} | FEED=${FEED_ADDR}`);
@@ -312,3 +348,4 @@ function startScheduler() {
 }
 
 startScheduler();
+
