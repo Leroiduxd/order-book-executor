@@ -1,4 +1,4 @@
-// trigger.js — multi-assets, per-asset PK, parallel execution
+// trigger.js — multi-assets, per-asset PK, parallel execution + verify on skipped
 import { ethers } from 'ethers';
 import { spawn } from 'node:child_process';
 
@@ -61,12 +61,13 @@ const RPC_URL    = 'https://atlantic.dplabs-internal.com';
 const FEED_ADDR  = '0x26524d23f70fbb17c8d5d5c3353a9693565b9be0'.toLowerCase();
 
 // API
-const API_BASE   = 'https://api.brokex.trade';
+const API_BASE    = 'https://api.brokex.trade';
+const VERIFY_BASE = API_BASE; // même host
 
 // Executor
 const EXECUTOR_PATH = 'executor.js';
-const EXECUTOR_ADDR = process.env.EXECUTOR_ADDR || '0x04a7cdf3b3aff0a0f84a94c48095d84baa91ec11'; // <-- mets l'addr ici ou via env
-const EXECUTOR_RPC  = process.env.RPC_URL || RPC_URL; // tu peux passer --rpc si tu préfères
+const EXECUTOR_ADDR = process.env.EXECUTOR_ADDR || '0x04a7cdf3b3aff0a0f84a94c48095d84baa91ec11';
+const EXECUTOR_RPC  = process.env.RPC_URL || RPC_URL;
 
 // Logique
 const RANGE_RATE    = 0.0002;   // ±0.02%
@@ -76,9 +77,6 @@ const RUN_SECONDS   = [3, 15, 27, 39, 51];
 
 /* =========================
    Per-asset Private Keys
-   - Remplis ici, ex: { 0:'0x...', 1:'0x...', 5002:'0x...' }
-   - OU exporte dans l'environnement: PK_<assetId>=0x...
-   - Fallback: process.env.PRIVATE_KEY (à éviter si tu veux strictement par actif)
 ========================= */
 const ASSET_PKS = {
   0:  '0x30e6b5a4b85aa2546c14126ae90ccd111d9a2a0ebea2d1054927fbcfc0bae679',
@@ -91,7 +89,6 @@ const ASSET_PKS = {
   16: '0x13b8780805c50c8f6c0e88020aa8bae32444b0844e886160dde3f64f2a25d33a',
   90: '0x2f3095bbe2e0e2b4d4821f668b4edd16f93057c1673df65d762410096344b2b9',
   2:  '0x4f963ab7fa45ff630cb6bcedf1b46e996a158214161fd982e40f987a5718a2c2',
-
   5010: '0x9b2869e965d495b437ac39b80b880ee4ccd937c90003136cffd2d4daaa3ed2a3',
   5000: '0xa0ba7957bf03c1bf540c3c054136dd757e10653132290e18a80f5155d2015923',
   5002: '0x1cc1b15a63c39e705dcbe33e8d5e537ab3c98162928dd0b90409e542fff7ffe7',
@@ -99,15 +96,12 @@ const ASSET_PKS = {
   5011: '0x377e9dc62a6cac94dbe2bf8ee42e1b67ec87af433aed9dd35dbb6812ce2cb8ef',
   5012: '0x9688709ad6a5e5d479420522e2d98b143f3016a907bc12e837b597c3c7e30936',
   5001: '0x07230cdac2d9527fe0dba37b65cfba502787a61b0537954136b4e10377a0424e',
-
   5501: '0x5f5c813fc653025604377fbc4a9607d36e0b24b9c8bee9e1f20a8dc867b93063',
   5500: '0x47c6a29d549627dbe2a08d117663db865f8cb832a2b7bafea5e58328c49763ce',
   5503: '0x31bdd848d64e471ff0c3f1045c71bdf07aaff3c6abe33ec8129e3bd0536ec0b0',
-
   6113: '0xd874c3b4ada4d76389a4ba6209fe713fe98a1199e7ceb6addbf543866cca379e',
   6114: '0x1e11e53e46013dd394862f88b35d9ae7832c89eb8c2e8183734f61163e785b20',
   6115: '0x1844472ac350150243541a2adf0c5685d8320336a73e66aba4301b94ec405b04',
-
   6004: '0xa24112c51b5d4e45fc68722912b3e07202ee6355abd9f2011b5d68522fc597b4',
   6005: '0x2d2c6e4d5f6e4981b8f20bbbd7e842c75046086c24ed15b3ae8f52eca79a5689',
   6010: '0xd74e3b4e10e90a5b47c837def4df6dfdbe1ba04d388261a53bc7f43ae781b7f1',
@@ -125,7 +119,7 @@ const ASSET_PKS = {
 };
 
 /* =========================
-   Ethers
+   Ethers & oracle feed
 ========================= */
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const FEED_ABI = [
@@ -154,16 +148,36 @@ async function fetchJson(url) {
 }
 
 function getPkForAsset(assetId) {
-  // priorité: ASSET_PKS > env PK_<id> > env PRIVATE_KEY
   if (ASSET_PKS[assetId]) return ASSET_PKS[assetId];
   if (process.env[`PK_${assetId}`]) return process.env[`PK_${assetId}`];
-  if (process.env.PRIVATE_KEY) return process.env.PRIVATE_KEY; // fallback (optionnel)
+  if (process.env.PRIVATE_KEY) return process.env.PRIVATE_KEY;
   return null;
 }
 
 /* =========================
+   Verify caller
+========================= */
+async function callVerify(ids) {
+  if (!ids?.length) return;
+  const url = `${VERIFY_BASE}/verify/${ids.join(',')}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      log(`[verify] HTTP ${res.status} ${res.statusText} :: ${txt}`);
+      return;
+    }
+    const json = await res.json().catch(() => ({}));
+    log(`[verify] ✅ ${url} → ${JSON.stringify(json)}`);
+  } catch (e) {
+    log(`[verify] 💥 ${url} → ${e?.message || String(e)}`);
+  }
+}
+
+/* =========================
    Executor wrapper
-   -> passe la clé privée en positionnel (3e arg) comme demandé
+   -> capture stdout/stderr, parse "simulate.* → skipped=K"
+   -> si skipped>0 => callVerify(batchIds)
 ========================= */
 async function runExecutor(mode, { assetId, ids, pk }) {
   if (!ids?.length) return;
@@ -175,7 +189,6 @@ async function runExecutor(mode, { assetId, ids, pk }) {
   const batches = chunk(ids, MAX_IDS);
   for (const group of batches) {
     const argIds = JSON.stringify(group); // "[..]"
-    // executor.js: mode, ids, <PRIVATE_KEY>, flags...
     const args = [
       EXECUTOR_PATH,
       mode,
@@ -186,11 +199,42 @@ async function runExecutor(mode, { assetId, ids, pk }) {
       `--rpc=${EXECUTOR_RPC}`
     ];
 
+    let out = '';
+    let err = '';
+    let skippedSim = 0;
+
     await new Promise((resolve, reject) => {
-      const p = spawn('node', args, { stdio: 'inherit' });
-      p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${mode} exit ${code}`)));
+      const p = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      p.stdout.on('data', (buf) => {
+        const s = buf.toString();
+        out += s;
+        process.stdout.write(s);
+      });
+      p.stderr.on('data', (buf) => {
+        const s = buf.toString();
+        err += s;
+        process.stderr.write(s);
+      });
+
+      p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${mode} exit ${code}`))));
       p.on('error', reject);
+    }).catch((e) => {
+      log(`[executor] 💥 ${mode} error:`, e?.message || String(e));
+      skippedSim = group.length; // prudence: tout vérifier si l’exec a échoué
     });
+
+    try {
+      const m1 = out.match(/simulate\.execLimits\s*→\s*executed=(\d+)\s*\|\s*skipped=(\d+)/);
+      const m2 = out.match(/simulate\.closeBatch\(\d+\)\s*→\s*closed=(\d+)\s*\|\s*skipped=(\d+)/);
+      if (m1) skippedSim = Number(m1[2] || 0);
+      if (m2) skippedSim = Number(m2[2] || 0);
+    } catch { /* noop */ }
+
+    if (skippedSim > 0) {
+      log(`[executor] 🔎 skipped=${skippedSim} → verify(${group.length} ids)`);
+      await callVerify(group);
+    }
 
     await sleep(CALL_DELAY_MS);
   }
@@ -203,7 +247,7 @@ const runningByAsset = new Set();
 
 async function runOnceForAsset(asset) {
   const assetId = asset.id;
-  if (runningByAsset.has(assetId)) return; // anti-overlap par actif
+  if (runningByAsset.has(assetId)) return;
   runningByAsset.add(assetId);
   try {
     // 1) Oracle (pairIndex = asset.id)
